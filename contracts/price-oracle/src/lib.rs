@@ -267,6 +267,17 @@ pub trait StellarFlowTrait {
     /// Returns true if the contract is frozen, false otherwise.
     fn is_frozen(env: Env) -> bool;
 
+    /// Halt or resume all public rate read queries via multi-sig governance.
+    ///
+    /// Requires at least 2 of the registered governance admins to authorize.
+    /// When `status` is `true`, every public rate read (get_price, get_last_price,
+    /// get_prices, get_price_with_status, get_price_safe, get_twap, get_index_price)
+    /// will panic with `Error::EmergencyHalted` until the halt is lifted.
+    fn set_emergency_halt(env: Env, admin1: Address, admin2: Address, status: bool) -> Result<(), Error>;
+
+    /// Return the current emergency halt state.
+    fn is_halted(env: Env) -> bool;
+
     /// Enable a 1-hour grace period during which the circuit-breaker safety
     /// checks (flash-crash, price floor, and price bounds) are bypassed.
     ///
@@ -351,32 +362,14 @@ pub enum Error {
     ContractDestroyed = 20,
     /// Delegate assignment is invalid.
     InvalidDelegate = 21,
-    /// No admin has been configured for this contract.
-    AdminNotSet = 22,
-    /// No pending admin transfer exists.
-    PendingAdminNotFound = 23,
-    /// Pending admin transfer timestamp is missing.
-    PendingAdminTimestampMissing = 24,
-    /// Caller is not the pending admin for the active transfer.
-    NotPendingAdmin = 25,
-    /// Admin transfer timelock has not expired yet.
-    AdminTimelockNotExpired = 26,
-    /// Contract is in emergency freeze state.
-    ContractFrozen = 27,
-    /// Caller is not the configured Community Council.
-    CouncilRequired = 28,
-    /// Caller is not a whitelisted price provider.
-    ProviderNotAuthorized = 29,
-    /// Price floor configuration is invalid.
-    InvalidPriceFloor = 30,
-    /// Price bounds configuration is invalid.
-    InvalidPriceBounds = 31,
-    /// Maximum deviation basis points configuration is invalid.
-    InvalidMaxDeviation = 32,
-    /// Normalized or aggregated price failed internal validation.
-    InvalidNormalizedPrice = 33,
-    /// Price normalization overflowed or divided by zero.
-    PriceMathOverflow = 34,
+    /// Governance action cannot execute: total votes cast are below the minimum quorum.
+    QuorumNotReached = 22,
+    /// Config rollback failed: no previous value has been backed up for this parameter.
+    NoPreviousConfig = 23,
+    /// Contract has not been initialized yet.
+    NotInitialized = 24,
+    /// Contract is emergency halted — all rate read queries are blocked.
+    EmergencyHalted = 25,
 }
 
 #[contract]
@@ -755,6 +748,9 @@ impl PriceOracle {
         env: Env,
         components: soroban_sdk::Vec<crate::types::AssetWeight>,
     ) -> Result<i128, Error> {
+        if crate::auth::_is_halted(&env) {
+            panic_with_error!(&env, Error::EmergencyHalted);
+        }
         if components.is_empty() {
             return Err(Error::AssetNotFound);
         }
@@ -1048,6 +1044,9 @@ impl PriceOracle {
     ///
     /// Returns `Error::AssetNotFound` when the asset is missing or stale.
     pub fn get_price(env: Env, asset: Symbol, verified: bool) -> Result<PriceData, Error> {
+        if crate::auth::_is_halted(&env) {
+            panic_with_error!(&env, Error::EmergencyHalted);
+        }
         let key = if verified {
             DataKey::VerifiedPrice(asset)
         } else {
@@ -1071,6 +1070,9 @@ impl PriceOracle {
     /// Returns the last known price data and marks it stale when TTL has expired.
     /// Always reads from the `VerifiedPrice` bucket.
     pub fn get_price_with_status(env: Env, asset: Symbol) -> Result<PriceDataWithStatus, Error> {
+        if crate::auth::_is_halted(&env) {
+            panic_with_error!(&env, Error::EmergencyHalted);
+        }
         match env
             .storage()
             .persistent()
@@ -1090,6 +1092,9 @@ impl PriceOracle {
     /// Returns `None` instead of an error when the asset is not found.
     /// Always reads from the `VerifiedPrice` bucket.
     pub fn get_price_safe(env: Env, asset: Symbol) -> Option<PriceData> {
+        if crate::auth::_is_halted(&env) {
+            panic_with_error!(&env, Error::EmergencyHalted);
+        }
         env.storage()
             .persistent()
             .get::<DataKey, PriceData>(&DataKey::VerifiedPrice(asset))
@@ -1100,6 +1105,9 @@ impl PriceOracle {
     /// Always reads from the `VerifiedPrice` bucket.
     /// Returns the price value as an i128, or an error if the asset is not found.
     pub fn get_last_price(env: Env, asset: Symbol) -> Result<i128, Error> {
+        if crate::auth::_is_halted(&env) {
+            panic_with_error!(&env, Error::EmergencyHalted);
+        }
         let price_data = Self::get_price(env, asset, true)?;
         Ok(price_data.price)
     }
@@ -1114,6 +1122,9 @@ impl PriceOracle {
         env: Env,
         assets: soroban_sdk::Vec<Symbol>,
     ) -> soroban_sdk::Vec<Option<crate::types::PriceEntry>> {
+        if crate::auth::_is_halted(&env) {
+            panic_with_error!(&env, Error::EmergencyHalted);
+        }
         let now = env.ledger().timestamp();
         let mut result = soroban_sdk::Vec::new(&env);
 
@@ -2640,6 +2651,28 @@ impl PriceOracle {
         crate::auth::_is_frozen(&env)
     }
 
+    /// Halt or resume all public rate read queries via multi-sig governance.
+    ///
+    /// Requires 2 distinct authorized admins. When `status` is `true`, every
+    /// public rate read panics with `Error::EmergencyHalted` until lifted.
+    pub fn set_emergency_halt(env: Env, admin1: Address, admin2: Address, status: bool) -> Result<(), Error> {
+        _require_not_destroyed(&env);
+        if admin1 == admin2 {
+            return Err(Error::MultiSigValidationFailed);
+        }
+        admin1.require_auth();
+        admin2.require_auth();
+        crate::auth::_require_authorized(&env, &admin1);
+        crate::auth::_require_authorized(&env, &admin2);
+        crate::auth::_set_halted(&env, status);
+        Ok(())
+    }
+
+    /// Return the current emergency halt state.
+    pub fn is_halted(env: Env) -> bool {
+        crate::auth::_is_halted(&env)
+    }
+
     /// Get the price buffer for a specific asset.
     ///
     /// Returns all relayer submissions for the current ledger,
@@ -2662,6 +2695,9 @@ impl PriceOracle {
 
     /// Get the Time-Weighted Average Price (TWAP) for a specific asset.
     pub fn get_twap(env: Env, asset: Symbol) -> Option<i128> {
+        if crate::auth::_is_halted(&env) {
+            panic_with_error!(&env, Error::EmergencyHalted);
+        }
         let key = DataKey::Twap(asset);
         let twap_buffer: soroban_sdk::Vec<(u64, i128)> = env.storage().temporary().get(&key)?;
 
