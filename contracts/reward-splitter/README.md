@@ -9,13 +9,14 @@ A Soroban smart contract for distributing tokens among multiple recipients accor
 - **Automatic Distribution**: Distribute tokens to all recipients according to their fixed shares
 - **Flexible Management**: Add, remove, and update recipient shares
 - **Token Agnostic**: Works with any Soroban token contract
+- **Default Parameter Reset**: Reset all parameters to their initial default values
 
 ## Architecture
 
 ### Data Structures
 
 - **Recipient**: Stores recipient address and their fixed share percentage
-- **DataKey**: Storage keys for contract state (admin, token, recipients, etc.)
+- **DataKey**: Storage keys for contract state (admin, token, recipients, defaults, etc.)
 
 ### Key Functions
 
@@ -28,8 +29,28 @@ A Soroban smart contract for distributing tokens among multiple recipients accor
 - `get_total_shares()`: Get total shares (should equal 10000 for full distribution)
 - `get_admin()`: Get admin address
 - `get_token()`: Get token address
+- `get_default_admin()`: Get the default admin address
+- `get_default_token()`: Get the default token address
 - `transfer_admin(current_admin, new_admin)`: Transfer admin to new address
 - `update_token(admin, new_token)`: Update the token to distribute
+- `reset_parameters(admin)`: Reset all parameters to their default values
+
+## Default Parameter Reset
+
+The contract includes a built-in mechanism to reset all parameters to their initial default values. This is useful for:
+
+- Emergency recovery from misconfiguration
+- Governance actions to restore contract to original state
+- Testing and development scenarios
+
+When `initialize()` is called, the initial admin and token addresses are stored as defaults. The `reset_parameters()` function can then be called by the current admin to restore:
+
+- Admin address to the default admin
+- Token address to the default token
+- Clear all recipients
+- Reset total shares to 0
+
+**Note**: This is a destructive action that cannot be undone. Use with caution.
 
 ## Usage Example
 
@@ -52,6 +73,13 @@ assert_eq!(contract.get_total_shares(), 10000);
 contract.distribute(&1000);
 
 // Each recipient receives 500 tokens
+
+// Reset parameters to defaults (emergency recovery)
+contract.reset_parameters(&admin);
+
+// Contract is now back to initial state
+assert_eq!(contract.get_total_shares(), 0);
+assert_eq!(contract.get_recipients().len(), 0);
 ```
 
 ## Error Handling

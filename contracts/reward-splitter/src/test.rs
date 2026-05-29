@@ -283,3 +283,68 @@ fn test_distribute_no_recipients() {
 
     client.distribute(&1000);
 }
+
+#[test]
+fn test_get_default_values() {
+    let env = Env::default();
+    let contract_id = env.register(RewardSplitter, ());
+    let client = RewardSplitterClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.initialize(&admin, &token);
+
+    assert_eq!(client.get_default_admin(), admin);
+    assert_eq!(client.get_default_token(), token);
+}
+
+#[test]
+fn test_reset_parameters() {
+    let env = Env::default();
+    let contract_id = env.register(RewardSplitter, ());
+    let client = RewardSplitterClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let new_token = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.initialize(&admin, &token);
+    client.add_recipient(&admin, &recipient, &10000);
+
+    // Change parameters
+    client.transfer_admin(&admin, &new_admin);
+    client.update_token(&new_admin, &new_token);
+
+    // Verify parameters changed
+    assert_eq!(client.get_admin(), new_admin);
+    assert_eq!(client.get_token(), new_token);
+    assert_eq!(client.get_total_shares(), 10000);
+
+    // Reset to defaults
+    client.reset_parameters(&new_admin);
+
+    // Verify parameters reset to defaults
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(client.get_token(), token);
+    assert_eq!(client.get_total_shares(), 0);
+    assert_eq!(client.get_recipients().len(), 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Unauthorized)")]
+fn test_reset_parameters_unauthorized() {
+    let env = Env::default();
+    let contract_id = env.register(RewardSplitter, ());
+    let client = RewardSplitterClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+
+    client.initialize(&admin, &token);
+
+    client.reset_parameters(&unauthorized);
+}

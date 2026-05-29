@@ -19,6 +19,8 @@ pub enum DataKey {
     Recipients,
     Initialized,
     TotalShares,
+    DefaultAdmin,
+    DefaultToken,
 }
 
 #[contracterror]
@@ -45,6 +47,10 @@ impl RewardSplitter {
         if env.storage().instance().has(&DataKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+
+        // Store current values as defaults
+        env.storage().instance().set(&DataKey::DefaultAdmin, &admin);
+        env.storage().instance().set(&DataKey::DefaultToken, &token);
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
@@ -287,6 +293,45 @@ impl RewardSplitter {
     pub fn update_token(env: Env, admin: Address, new_token: Address) {
         Self::require_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Token, &new_token);
+    }
+
+    /// Reset all parameters to their default values
+    pub fn reset_parameters(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+
+        let default_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::DefaultAdmin)
+            .unwrap();
+        let default_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::DefaultToken)
+            .unwrap();
+
+        env.storage().instance().set(&DataKey::Admin, &default_admin);
+        env.storage().instance().set(&DataKey::Token, &default_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::Recipients, &Vec::<Recipient>::new(&env));
+        env.storage().instance().set(&DataKey::TotalShares, &0u32);
+    }
+
+    /// Get the default admin address
+    pub fn get_default_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::DefaultAdmin)
+            .unwrap()
+    }
+
+    /// Get the default token address
+    pub fn get_default_token(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::DefaultToken)
+            .unwrap()
     }
 
     /// Helper function to require admin authorization
