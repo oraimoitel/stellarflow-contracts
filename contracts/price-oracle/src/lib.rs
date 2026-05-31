@@ -436,6 +436,18 @@ pub enum ContractError {
     StaleRateData = 26,
     /// Contract is emergency halted — all rate read queries are blocked.
     EmergencyHalted = 25,
+    /// Slash amount string is missing, malformed, or is not a positive integer.
+    InvalidSlashAmount = 26,
+    /// No SEP-41 token has been configured for slashing operations.
+    SlashTokenNotSet = 27,
+    /// No insurance reserve address has been configured.
+    InsuranceReserveNotSet = 28,
+    /// A slash amount exceeded the relayer's available stake.
+    InsufficientStake = 29,
+    /// Missed-block infraction counts must be positive and in range.
+    InvalidInfractionCount = 30,
+    /// A new price write is not allowed until the ledger advances past the previous write.
+    DuplicatePriceWriteInSameLedger = 31,
 }
 
 #[contract]
@@ -689,6 +701,17 @@ fn has_provider_submitted(buffer: &PriceBuffer, provider: &Address) -> bool {
         .entries
         .iter()
         .any(|entry| entry.provider == *provider)
+}
+
+/// Ensure the current ledger sequence has advanced since the last price write.
+fn require_ledger_sequence_advanced(env: &Env, previous: Option<&PriceData>) -> Result<u32, Error> {
+    let current_ledger: u32 = env.ledger().sequence().into();
+    if let Some(prev) = previous {
+        if current_ledger <= prev.ledger_sequence {
+            return Err(Error::DuplicatePriceWriteInSameLedger);
+        }
+    }
+    Ok(current_ledger)
 }
 
 /// Truncate buffer entries to MAX_MEDIAN_ENTRIES, keeping highest-weight providers.
@@ -993,6 +1016,7 @@ impl PriceOracle {
                 &PriceData {
                     price: 0,
                     timestamp: env.ledger().timestamp(),
+                    ledger_sequence: env.ledger().sequence().into(),
                     provider: env.current_contract_address(),
                     decimals: 0,
                     confidence_score: 0,
@@ -1409,9 +1433,11 @@ impl PriceOracle {
             let now = env.ledger().timestamp();
 
             if let Some(mut current) = existing {
+                let current_ledger = require_ledger_sequence_advanced(&env, Some(&current))?;
                 if current.price == val {
                     // Price unchanged — only refresh the timestamp (zero-write optimisation).
                     current.timestamp = now;
+                    current.ledger_sequence = current_ledger;
                     storage.set(&key, &current);
                     update_twap(&env, asset.clone(), val, now);
                     env.events().publish((Symbol::new(&env, "price_updated_event"),), (asset.clone(), val));
@@ -1423,6 +1449,7 @@ impl PriceOracle {
             let price_data = PriceData {
                 price: normalized,
                 timestamp: now,
+                ledger_sequence: env.ledger().sequence().into(),
                 provider: env.current_contract_address(),
                 // All stored prices are 9-decimal normalized.
                 decimals: 9,
@@ -1505,10 +1532,17 @@ impl PriceOracle {
             return Err(ContractError::InvalidNormalizedPrice);
         }
 
+        let previous_price: Option<PriceData> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommunityPrice(asset.clone()));
+        require_ledger_sequence_advanced(&env, previous_price.as_ref())?;
+
         let now = env.ledger().timestamp();
         let price_data = PriceData {
             price: normalized,
             timestamp: now,
+            ledger_sequence: env.ledger().sequence().into(),
             provider: source,
             // All stored prices are 9-decimal normalized.
             decimals: 9,
@@ -1677,8 +1711,10 @@ impl PriceOracle {
         }
         let storage = env.storage().persistent();
         let key = DataKey::VerifiedPrice(asset.clone());
-        let old_price: i128 = storage
-            .get::<DataKey, PriceData>(&key)
+        let existing_price: Option<PriceData> = storage.get(&key);
+        require_ledger_sequence_advanced(&env, existing_price.as_ref())?;
+        let old_price: i128 = existing_price
+            .as_ref()
             .map(|pd| pd.price)
             .unwrap_or(0);
 
@@ -1751,12 +1787,16 @@ impl PriceOracle {
         let price_data = PriceData {
             price: median_price,
             timestamp: env.ledger().timestamp(),
+            ledger_sequence: env.ledger().sequence().into(),
             provider: source.clone(),
             // All stored prices are 9-decimal normalized.
             decimals: 9,
             confidence_score,
             ttl,
         };
+
+        // Record the provider's heartbeat (last seen ledger height) - tracking node liveness
+        storage.set(&DataKey::ProviderLastSeenLedger(source.clone()), &env.ledger().sequence());
 
         storage.set(&key, &price_data);
         update_twap(&env, asset.clone(), median_price, env.ledger().timestamp());
@@ -1779,6 +1819,22 @@ impl PriceOracle {
             confidence_score,
         };
         callbacks::notify_subscribers(&env, &payload);
+
+        // ── Gas Tank reimbursement (Issue #266) ──────────────────────────────
+        // After every successful price submission, reimburse the relayer for
+        // their on-chain transaction costs via the Gas Tank escrow contract.
+        // This call is a no-op when no Gas Tank has been configured.
+        if let Some(gas_tank_addr) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::GasTank)
+        {
+            // Call reimburse(relayer) on the Gas Tank contract.
+            // We use env.invoke_contract so we stay no_std compatible.
+            let reimburse_fn = Symbol::new(&env, "reimburse");
+            let args = soroban_sdk::vec![&env, payload.provider.clone().to_val()];
+            let _: () = env.invoke_contract(&gas_tank_addr, &reimburse_fn, args);
+        }
 
         Ok(())
     }
@@ -2850,8 +2906,46 @@ impl PriceOracle {
         admin2.require_auth();
         crate::auth::_require_authorized(&env, &admin1);
         crate::auth::_require_authorized(&env, &admin2);
+
+        let previous_halt_state = crate::auth::_is_halted(&env);
         crate::auth::_set_halted(&env, status);
+
+        // Graceful Recovery: If we are resuming from a halt (status: true -> false),
+        // clear out older tracking metrics to ensure synchronization.
+        if previous_halt_state && !status {
+            Self::_perform_graceful_recovery(&env);
+        }
+
         Ok(())
+    }
+
+    /// Internal routine to clear stale metrics when resuming from a halt.
+    fn _perform_graceful_recovery(env: &Env) {
+        // 1. Reset baseline ledger to mark the "new beginning" of the system.
+        env.storage().instance().set(&DataKey::BaselineLedger, &env.ledger().sequence());
+
+        // 2. Clear RecentEvents activity feed to remove stale pre-halt logs.
+        env.storage().temporary().remove(&DataKey::RecentEvents);
+
+        // 3. Reset provider metrics.
+        // During a system-wide halt, relayers may have been unable to submit.
+        // We reset their counters so they aren't unfairly penalized for the halt duration.
+        let relayers = crate::auth::_get_active_relayers(env);
+        for relayer in relayers.iter() {
+            // Reset consecutive missed blocks.
+            env.storage().persistent().remove(&DataKey::ProviderConsecutiveMissedBlocks(relayer.clone()));
+            // Reset uptime streak start (they must earn a new 48h streak).
+            env.storage().persistent().remove(&DataKey::ProviderUptimeStreakStart(relayer.clone()));
+            // Update last seen to current ledger so they aren't flagged as inactive immediately.
+            env.storage().persistent().set(&DataKey::ProviderLastSeenLedger(relayer.clone()), &env.ledger().sequence());
+        }
+
+        // 4. Clear TWAPs for all tracked assets.
+        // We clear these because the historical prices in the buffer are now stale.
+        let assets = get_tracked_assets(env);
+        for asset in assets.iter() {
+            env.storage().temporary().remove(&DataKey::Twap(asset));
+        }
     }
 
     /// Return the current emergency halt state.
@@ -3058,6 +3152,39 @@ impl PriceOracle {
         env.storage().persistent().get(&DataKey::InsuranceReserve)
     }
 
+    // ── Gas Tank Integration (Issue #266) ────────────────────────────────────
+
+    /// Register the Gas Tank escrow contract address.
+    ///
+    /// Once set, `update_price` will automatically call `reimburse(relayer)` on
+    /// the Gas Tank after every successful price submission so that relayer
+    /// on-chain transaction fees are covered by pre-funded consumer deposits.
+    ///
+    /// Only admin-authorised callers may update this setting.
+    pub fn set_gas_tank(env: Env, admin: Address, gas_tank: Address) -> Result<(), Error> {
+        _require_not_destroyed(&env);
+        _require_initialized(&env);
+        crate::auth::_require_not_frozen(&env);
+        admin.require_auth();
+        crate::auth::_require_authorized(&env, &admin);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::GasTank, &gas_tank);
+
+        env.events().publish(
+            (Symbol::new(&env, "gas_tank_set"),),
+            (admin, gas_tank),
+        );
+
+        Ok(())
+    }
+
+    /// Return the configured Gas Tank contract address, if any.
+    pub fn get_gas_tank(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::GasTank)
+    }
+
     /// Deposit stake tokens into the contract on behalf of a relayer.
     ///
     /// The relayer must authorize this call. Tokens are transferred from the
@@ -3166,6 +3293,60 @@ impl PriceOracle {
             .unwrap_or(0)
     }
 
+    /// Report that a relayer missed one or more consecutive blocks.
+    ///
+    /// This increments the relayer's infraction counter and scales future
+    /// slashing penalties exponentially until the relayer maintains 48 hours
+    /// of uninterrupted uptime.
+    pub fn report_missed_blocks(
+        env: Env,
+        admin: Address,
+        relayer: Address,
+        missed_blocks: u32,
+    ) -> Result<i128, Error> {
+        _require_not_destroyed(&env);
+        _require_initialized(&env);
+        crate::auth::_require_not_frozen(&env);
+        admin.require_auth();
+        crate::auth::_require_authorized(&env, &admin);
+
+        crate::slashing::report_missed_blocks(&env, &relayer, missed_blocks)
+    }
+
+    /// Report a period of uninterrupted uptime for a relayer.
+    ///
+    /// The infraction multiplier is reset only after the relayer accumulates a
+    /// full 48-hour streak of uninterrupted healthy operation.
+    pub fn report_successful_uptime(
+        env: Env,
+        admin: Address,
+        relayer: Address,
+    ) -> Result<bool, Error> {
+        _require_not_destroyed(&env);
+        _require_initialized(&env);
+        crate::auth::_require_not_frozen(&env);
+        admin.require_auth();
+        crate::auth::_require_authorized(&env, &admin);
+
+        crate::slashing::report_successful_uptime(&env, &relayer)
+    }
+
+    /// Get the relayer's current consecutive missed-block count.
+    pub fn get_provider_consecutive_missed_blocks(env: Env, relayer: Address) -> u32 {
+        crate::slashing::get_consecutive_missed_blocks(&env, &relayer)
+    }
+
+    /// Get the current multiplier that will scale future slash amounts for the
+    /// relayer's consecutive missed blocks.
+    pub fn get_slashing_multiplier(env: Env, relayer: Address) -> Result<i128, Error> {
+        crate::slashing::get_slash_multiplier(&env, &relayer)
+    }
+
+    /// Get the relayer's uptime streak start timestamp, if any.
+    pub fn get_uptime_streak_start(env: Env, relayer: Address) -> Option<u64> {
+        crate::slashing::get_uptime_streak_start(&env, &relayer)
+    }
+
     /// Governance-gated direct slash entry point.
     ///
     /// This is a convenience wrapper that lets an authorized admin execute a
@@ -3194,6 +3375,22 @@ impl PriceOracle {
         crate::auth::_require_authorized(&env, &executor);
 
         crate::slashing::execute_slash_internal(&env, &executor, &bad_relayer, amount)
+    }
+
+    pub fn get_provider_last_seen_ledger(env: Env, provider: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProviderLastSeenLedger(provider))
+            .unwrap_or(0)
+    }
+
+    pub fn is_provider_active(env: Env, provider: Address, window: u32) -> bool {
+        let last_seen = Self::get_provider_last_seen_ledger(env.clone(), provider);
+        if last_seen == 0 {
+            return false;
+        }
+        let current_ledger = env.ledger().sequence();
+        current_ledger <= last_seen.saturating_add(window)
     }
 }
 
