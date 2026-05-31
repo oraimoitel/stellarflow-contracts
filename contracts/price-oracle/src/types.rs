@@ -86,6 +86,9 @@ pub enum DataKey {
     SlashToken,
     /// The address of the ecosystem insurance reserve that receives slashed funds.
     InsuranceReserve,
+    /// The ledger sequence number when the oracle last resumed from a halt.
+    /// Used to ignore tracking metrics (TWAP, RecentEvents) from before the recovery.
+    BaselineLedger,
 }
 
 /// Decimal metadata for an asset pair.

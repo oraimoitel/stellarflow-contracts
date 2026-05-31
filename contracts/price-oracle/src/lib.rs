@@ -2860,8 +2860,46 @@ impl PriceOracle {
         admin2.require_auth();
         crate::auth::_require_authorized(&env, &admin1);
         crate::auth::_require_authorized(&env, &admin2);
+
+        let previous_halt_state = crate::auth::_is_halted(&env);
         crate::auth::_set_halted(&env, status);
+
+        // Graceful Recovery: If we are resuming from a halt (status: true -> false),
+        // clear out older tracking metrics to ensure synchronization.
+        if previous_halt_state && !status {
+            Self::_perform_graceful_recovery(&env);
+        }
+
         Ok(())
+    }
+
+    /// Internal routine to clear stale metrics when resuming from a halt.
+    fn _perform_graceful_recovery(env: &Env) {
+        // 1. Reset baseline ledger to mark the "new beginning" of the system.
+        env.storage().instance().set(&DataKey::BaselineLedger, &env.ledger().sequence());
+
+        // 2. Clear RecentEvents activity feed to remove stale pre-halt logs.
+        env.storage().temporary().remove(&DataKey::RecentEvents);
+
+        // 3. Reset provider metrics.
+        // During a system-wide halt, relayers may have been unable to submit.
+        // We reset their counters so they aren't unfairly penalized for the halt duration.
+        let relayers = crate::auth::_get_active_relayers(env);
+        for relayer in relayers.iter() {
+            // Reset consecutive missed blocks.
+            env.storage().persistent().remove(&DataKey::ProviderConsecutiveMissedBlocks(relayer.clone()));
+            // Reset uptime streak start (they must earn a new 48h streak).
+            env.storage().persistent().remove(&DataKey::ProviderUptimeStreakStart(relayer.clone()));
+            // Update last seen to current ledger so they aren't flagged as inactive immediately.
+            env.storage().persistent().set(&DataKey::ProviderLastSeenLedger(relayer.clone()), &env.ledger().sequence());
+        }
+
+        // 4. Clear TWAPs for all tracked assets.
+        // We clear these because the historical prices in the buffer are now stale.
+        let assets = get_tracked_assets(env);
+        for asset in assets.iter() {
+            env.storage().temporary().remove(&DataKey::Twap(asset));
+        }
     }
 
     /// Return the current emergency halt state.
